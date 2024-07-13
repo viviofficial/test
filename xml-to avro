@@ -1,0 +1,518 @@
+import json              
+import xml.etree.ElementTree as ET
+import boto3
+import botocore
+import os
+import time, urllib.parse
+import avro.schema
+from avro.datafile import DataFileReader, DataFileWriter
+from avro.io import DatumReader, DatumWriter
+
+
+#List of dictionaries containing the last counts of primary ids                                       
+list_of_counts = []         
+client= boto3.client('s3')
+s3 = boto3.resource('s3')
+
+#fn for fetching the last counts of primary ids from avro
+def fetch_previous_last_counts():
+    counts = {}
+    try:
+        s3.Bucket('glue-poc').download_file('folder/tmp/last_counts.avro', '/tmp/d_last_counts.avro')
+        reader = DataFileReader(open("/tmp/d_last_counts.avro", "rb"), DatumReader())
+        for entry in reader:
+            counts[entry["COLUMN_NAME"]] = entry["COUNTER_VALUE"] + 1
+            
+        reader.close()
+    except botocore.exceptions.ClientError:
+        counts = {"INV_ID": 1 , "TABLE_ID" : 1, "COLUMN_ID" : 1, "INSTANCE_ID" : 1,"TRANSFORM_ID" : 1}
+    return counts
+
+
+
+
+#fn to make avro of all tables except last_counts
+def make_avro(source_list,avro_schema,tmp_avro_name,s3_avro_name):
+    if(id_count["INV_ID"] == 1):
+        schema = avro.schema.parse(open(avro_schema, "rb").read())
+        writer = DataFileWriter(open(tmp_avro_name, "ab+"), DatumWriter(),schema)
+    else:
+        s3.Bucket('glue-poc').download_file(s3_avro_name, tmp_avro_name)
+        writer = DataFileWriter(open(tmp_avro_name, "ab+"), DatumWriter())
+                    
+    for i in source_list:
+        writer.append(i)
+    writer.close()
+    s3.Bucket(bucket_name).upload_file(tmp_avro_name, s3_avro_name)
+
+
+
+#fn to make avro of last_counts 
+def make_last_counts_avro(source_list,avro_schema,avro_name):
+    schema = avro.schema.parse(open(avro_schema, "rb").read())
+    writer = DataFileWriter(open(avro_name, "wb"), DatumWriter(),schema)
+    for i in source_list:
+        writer.append(i)
+        print("last_counts",i)
+    writer.close()
+    s3.Bucket(bucket_name).upload_file('/tmp/u_last_counts.avro','folder/tmp/last_counts.avro')
+    
+    
+
+#fn for transformations
+def fetch_transformation_listing(folder,transform_id):
+    list_of_attribs= []
+    # for repo in root.findall('*'):
+    #     for folder in repo:  
+    for func in folder:
+            if func.tag == "MAPPING":
+                for portion in func:
+                    if portion.tag == "TRANSFORMATION":
+                        attribs = {}
+                        att = portion.attrib
+                        attribs["TRANSFORM_ID"] = transform_id
+                        attribs["TRANSFORMATION_NAME"] = att.get(data["common"]["NAME"])
+                        attribs["TRANSFORMATION_TYPE"] = att.get(data["transformation_listing"]["Transformation_Type" ])
+                        attribs["MAPPINGNAME"] = func.attrib.get(data["transformation_listing"]["MAPPING_NAME"])
+                        attribs["ISVALID"] = func.attrib.get(data["transformation_listing"]["MAPPING_ISVALID"])
+                        transform_id = transform_id + 1
+                        list_of_attribs.append(attribs)
+                        print(attribs)
+
+    list_of_counts.append({"TABLE_NAME" : "TRANSFORMATION_LISTING","COLUMN_NAME" : "TRANSFORM_ID","COUNTER_VALUE":transform_id-1})
+    make_avro(list_of_attribs,"./avsc/transformation_listing.avsc","/tmp/u_transformation_listing.avro", 'folder/tmp/transformation_listing.avro')
+
+
+def fetch_inventory_transformation_relation(root,inv_id,transform_id):    
+    list_of_attribs= []
+    for repo in root.findall('*'):
+        for folder in repo: 
+            for func in folder:
+                if func.tag == "MAPPING":
+                    for portion in func:
+                        if portion.tag == "TRANSFORMATION":
+                            attribs = {}
+                            attribs["INV_ID"] = inv_id
+                            attribs["TRANSFORM_ID"] = transform_id
+                            list_of_attribs.append(attribs)
+                            transform_id = transform_id + 1
+
+    make_avro(list_of_attribs,"./avsc/inventory_transformation_relation.avsc","/tmp/u_inventory_transformation_relation.avro","folder/tmp/inventory_transformation_relation.avro")
+
+
+
+def fetch_column_relation(root,inv_id,instance_id):
+    reference = {}
+    for repo in root.findall('*'):
+        for folder in repo:  
+            for mapping in folder:
+                for portion in mapping:
+                    if portion.tag == "INSTANCE":
+                        att = portion.attrib
+                        reference[att.get(data["common"]["NAME"])] = instance_id
+                        instance_id = instance_id + 1
+    
+    list_of_attribs= []
+    for repo in root.findall('*'):
+        for folder in repo:  
+            for mapping in folder:
+                if mapping.tag == "MAPPING":
+                    for portion in mapping:
+                        if portion.tag == "CONNECTOR":
+                            attribs = {}
+                            att = portion.attrib
+                            attribs["INV_ID"] = inv_id
+                            attribs["FROMFIELD"] = att.get(data["column_relation"]["FROMFIELD"])
+                            attribs["FROMINSTANCE"] = att.get(data["column_relation"]["FROMINSTANCE"])
+                            attribs["FROMINSTANCETYPE"] = att.get(data["column_relation"]["FROMINSTANCETYPE"])
+                            attribs["TOFIELD"] = att.get(data["column_relation"]["TOFIELD"])
+                            attribs["TOINSTANCE"] = att.get(data["column_relation"]["TOINSTANCE"])
+                            attribs["TOINSTANCETYPE"] = att.get(data["column_relation"]["TOINSTANCETYPE"])
+                            attribs["CATEGORY"] = portion.tag
+                            attribs["ID_FROMINSTANCE"] = reference[att.get(data["column_relation"]["FROMINSTANCE"])]
+                            attribs["ID_TOINSTANCE"] = reference[att.get(data["column_relation"]["TOINSTANCE"])]
+                            list_of_attribs.append(attribs)
+
+    make_avro(list_of_attribs,"./avsc/column_relation.avsc","/tmp/u_column_relation.avro","folder/tmp/column_relation.avro")                    
+
+                        
+                        
+def fetch_inventory_master(root,inv_id):
+    print(inv_id)
+    list_of_attribs = []
+    total_transformation = 0
+    total_mapping =0
+    file_type =''
+    for repo in root.findall('*'):
+        attribs ={}
+        for folder in repo:  
+            for func in folder:
+                if func.tag == "MAPPING":
+                    file_type= "MAPPING"
+                    for section in func:
+                        if section.tag == "TRANSFORMATION":
+                            total_mapping = total_mapping + 1
+                            for trans in section:
+                                if trans.tag =='TRANSFORMFIELD' or  trans.tag =='TABLEATTRIBUTE'or trans.tag == 'GROUP':
+                                    total_transformation = total_transformation + 1                              
+                            
+                if func.tag =='SESSION':
+                    file_type = "SESSION" 
+                    
+        attribs["INV_ID"]= inv_id
+        attribs["OBJECT_NAME"]= filename
+        attribs["MAPPING_COUNT"]= total_mapping
+        attribs["TRANSFORMATION_COUNT"]= total_transformation
+        attribs["COMPLEXITY_SCORE"]=" "
+        attribs["DBTYPE"]= repo.attrib.get('DATABASETYPE')
+        attribs["OBJECT_TYPE"]= file_type
+        attribs["OBJECT_DESCRIPTION"]= " "
+        list_of_attribs.append(attribs)
+        
+    list_of_counts.append({"TABLE_NAME" : "INVENTORY_MASTER","COLUMN_NAME" : "INV_ID","COUNTER_VALUE":inv_id}) 
+    make_avro(list_of_attribs,"./avsc/inventory_master.avsc","/tmp/u_inventory_master.avro","folder/tmp/inventory_master.avro")
+    
+    
+def fetch_transformation_relation(root,transform_id):
+    list_of_attribs = []
+    for repo in root.findall('*'):
+        for folder in repo:  
+            for func in folder:
+                if func.tag == "MAPPING":
+                    for section in func:
+                        if section.tag == "TRANSFORMATION":
+                            for trans in section:
+                                if trans.tag =='TRANSFORMFIELD'or trans.tag =='TABLEATTRIBUTE'or trans.tag =='GROUP':
+                                    temp_fields = trans.attrib
+                                    attribs ={}
+                                    attribs["TRANSFORM_ID"]= transform_id
+                                    attribs["TAG_TRANSFORMFIELD_OR_TABLEATTRIBUTE_OR_GROUP_TYPE"]= trans.tag
+                                    attribs["NAME"]= temp_fields.get(data["common"]["NAME"])
+                                    attribs["DATATYPE"]= temp_fields.get(data["transformation_relation"]["DATATYPE"])
+                                    attribs["PORTTYPE"]= temp_fields.get(data["transformation_relation"]["PORTTYPE"])
+                                    attribs["EXPRESSION"]= temp_fields.get(data["transformation_relation"]["EXPRESSION"])
+                                    attribs["EXPRESSIONTYPE"]= temp_fields.get(data["transformation_relation"]["EXPRESSIONTYPE"])
+                                    attribs["GROUP"]= temp_fields.get(data["transformation_relation"]["GROUP"])
+                                            
+                                    attribs["TABLEATTRIBUTE_VALUE"]= temp_fields.get(data["transformation_relation"]["TABLEattibiute_VALUE"])
+                                    attribs["GROUP_TYPE"]= temp_fields.get(data["transformation_relation"]["GROUP_TYPE"])
+                                    list_of_attribs.append(attribs)
+                            transform_id = transform_id + 1
+    
+    make_avro(list_of_attribs,"./avsc/transformation_relation.avsc","/tmp/u_transformation_relation.avro","folder/tmp/transformation_relation.avro") 
+    
+    
+
+
+def fetch_table_column_relation(root,inv_id , table_id , column_id):
+    list_of_attribs= []
+    for repo in root.findall('*'):
+        for folder in repo:
+            for func in folder:
+                if func.tag =="SOURCE" or func.tag == "TARGET":
+                    att = func.attrib
+
+                    if inv_id != 1:
+                        s3.Bucket('glue-poc').download_file('folder/tmp/table_master.avro', '/tmp/d_table_master.avro')
+                        reader = DataFileReader(open("/tmp/d_table_master.avro", "rb"), DatumReader())
+                        name = att.get(data["common"]["NAME"])
+                        dtype = att.get(data["table_master"]["DB_Type"])
+                        dbname = att.get(data["table_master"]["DBD_Name"])
+                        skip = 0
+                        for entry in reader:
+                            if(entry["NAME"]==name  and entry["DATABASETYPE"]==dtype and entry["DBDNAME"]==dbname):
+                                skip = skip + 1
+                                break
+
+                        reader.close()
+
+                        if skip > 0:
+                            continue
+                          
+                    for section in func:
+                        attribs = {}
+                        att = section.attrib
+                        attribs["TABLE_ID"] = table_id
+                        attribs["COLUMN_ID"] = column_id
+                        if att.get(data["table_column_relation"]["KEYTYPE"]) == data["table_column_relation"]["KEYTYPE_VALUE"]:
+                            attribs["IS_KEY"] = "NO"
+                        else:
+                            attribs["IS_KEY"] = "YES"
+                        list_of_attribs.append(attribs)
+                        column_id = column_id + 1
+                    table_id = table_id + 1
+
+    make_avro(list_of_attribs,"./avsc/table_column_relation.avsc","/tmp/u_table_column_relation.avro","folder/tmp/table_column_relation.avro")
+    
+
+
+def fetch_column_master(root,inv_id,column_id):
+    list_of_attribs = []
+    for repo in root.findall('*'):
+        for folder in repo:
+            for func in folder:
+                if func.tag == "SOURCE" or func.tag == "TARGET":
+                    att = func.attrib
+
+                    if inv_id != 1 : 
+                        s3.Bucket('glue-poc').download_file('folder/tmp/table_master.avro', '/tmp/d_table_master.avro')
+                        reader = DataFileReader(open("/tmp/d_table_master.avro", "rb"), DatumReader())
+                        name = att.get(data["common"]["NAME"])
+                        dtype = att.get(data["table_master"]["DB_Type"])
+                        dbname = att.get(data["table_master"]["DBD_Name"])
+                        skip = 0
+                        for entry in reader:
+                            if(entry["NAME"]==name  and entry["DATABASETYPE"]==dtype and entry["DBDNAME"]==dbname):
+                                skip = skip + 1
+                                break
+                        reader.close()
+
+                        if skip > 0:
+                            continue
+            
+                    for sec in func:
+                        attribs = {}
+                        att = sec.attrib
+                        attribs["COLUMN_ID"]= column_id
+                        attribs["COLUMN_NAME"]= att.get(data["common"]["NAME"])
+                        attribs["COLUMN_TYPE"]= att.get(data["column_master"]["Column_Type"])
+                        attribs["COLUMN_DESCRIPTION"]= att.get(data["column_master"]["Column_Description"])
+                        attribs["COLUMN_LENGTH"] = att.get(data["column_master"]["Column_Length"])
+                        attribs["COLUMN_USAGE"] = att.get(data["column_master"]["Column_Usage"])  
+                        attribs["COLUMN_SEQ"] = att.get(data["column_master"]["Column_Seq"])
+                        attribs["KEY_TYPE"]= att.get(data["column_master"]["Key_Type"])
+                        attribs["NULLABLE"] = att.get(data["column_master"]["Nullable"])
+                        column_id = column_id + 1
+                        list_of_attribs.append(attribs)
+    list_of_counts.append({"TABLE_NAME" : "COLUMN_MASTER","COLUMN_NAME" : "COLUMN_ID","COUNTER_VALUE":column_id-1})
+    make_avro(list_of_attribs,"./avsc/column_master.avsc","/tmp/u_column_master.avro","folder/tmp/column_master.avro") 
+    
+#fn for tables
+def fetch_table_master(root,inv_id,table_id):
+    list_of_attribs= []
+    for repo in root.findall('*'):
+        for folder in repo:  
+            for func in folder:
+                attribs = {}
+                if func.tag =="SOURCE" or func.tag == "TARGET":
+                    att = func.attrib
+
+                    if inv_id != 1:
+                        s3.Bucket('glue-poc').download_file('folder/tmp/table_master.avro', '/tmp/d_table_master.avro')
+                        reader = DataFileReader(open("/tmp/d_table_master.avro", "rb"), DatumReader())
+                        name = att.get(data["common"]["NAME"])
+                        dtype = att.get(data["table_master"]["DB_Type"])
+                        dbname = att.get(data["table_master"]["DBD_Name"])
+                        skip = 0
+                        for entry in reader:
+                            if(entry["NAME"]==name and entry["DATABASETYPE"]==dtype and entry["DBDNAME"]==dbname):
+                                skip = skip + 1
+                                break
+                        reader.close()
+
+                        if skip > 0:
+                            continue
+
+                    attribs["TABLE_ID"] = table_id
+                    attribs["NAME"] = att.get(data["common"]["NAME"])
+                    attribs["TABLE_TYPE"] = att.get(data["table_master"]["Table_Type"])
+                    attribs["TABLE_DIRECTION"] = att.get(data["table_master"]["Table_Direction"])
+                    attribs["DATABASETYPE"] = att.get(data["table_master"]["DB_Type"])
+                    attribs["DBDNAME"] = att.get(data["table_master"]["DBD_Name"])
+                    list_of_attribs.append(attribs)
+                    table_id = table_id + 1
+
+    list_of_counts.append({"TABLE_NAME" : "TABLE_MASTER","COLUMN_NAME" : "TABLE_ID","COUNTER_VALUE":table_id-1})
+    make_avro(list_of_attribs,"./avsc/table_master.avsc","/tmp/u_table_master.avro","folder/tmp/table_master.avro")    
+
+  
+ #fn for instances
+def fetch_instance(root,inv_id,instance_id,transform_id):
+    reference = {}
+    stage = []
+    flag = 0
+    tmp = {}
+    for repo in root.findall('*'):
+        for folder in repo:  
+            for func in folder:
+                #for getting id of source or target in reference dictionary
+                if func.tag =="SOURCE" or func.tag == "TARGET":
+                    att = func.attrib
+                    s3.Bucket('glue-poc').download_file('/tmp/table_master.avro', '/tmp/d_table_master.avro')
+                    reader = DataFileReader(open("/tmp/d_table_master.avro", "rb"), DatumReader())
+                    name = att.get(data["common"]["NAME"])
+                    dtype = att.get(data["table_master"]["DB_Type"])
+                    dbname = att.get(data["table_master"]["DBD_Name"])
+                    for entry in reader:
+                        if(entry["NAME"] == name  and entry["DATABASETYPE"] == dtype and entry["DBDNAME"] == dbname):
+                            count = entry["TABLE_ID"]
+                            break
+                    reader.close()
+                    reference[att.get(data["common"]["NAME"])] = count
+
+                #for getting id of transformations in reference dictionary
+                if func.tag == "MAPPING":
+                    count = 3
+                    for transformation in func:
+                        if transformation.tag == "TRANSFORMATION":
+                                        
+                            att = transformation.attrib
+                            reference[att.get(data["common"]["NAME"])] = transform_id
+                            transform_id = transform_id + 1
+                                        
+                            if att.get(data["transformation_listing"]["Transformation_Type"]) == "Source Qualifier":
+                                stage.append({att.get(data["transformation_listing"]["Transformation_Type"]) : 2,att.get(data["common"]["NAME"]): "name"})
+                                tmp[att.get(data["transformation_listing"]["Transformation_Type"])] = []
+            
+                                
+                            else:
+                                stage.append({att.get(data["transformation_listing"]["Transformation_Type"]) : count, att.get(data["common"]["NAME"]): "name"})
+                                tmp[att.get(data["transformation_listing"]["Transformation_Type"])] = []
+                                count =count + 1
+                                flag = flag + 1
+    list_of_attribs= []
+    for repo in root.findall('*'):
+        for folder in repo:  
+            for func in folder:
+                for portion in func:
+                    if portion.tag == "INSTANCE":
+                        attribs = {}
+                        att = portion.attrib
+                        attribs["Inv_ID"] = inv_id
+                        attribs["INSTANCE_ID"] = instance_id
+                        attribs["INSTANCE_NAME"] = att.get(data["common"]["NAME"])
+                        attribs["REUSABLE"] = att.get(data["instance"]["REUSABLE"])
+                        attribs["TRANSFORMATION_NAME"] =att.get(data["instance"]["TRANSFORMATION_NAME"])
+                        attribs["TRANSFORMATION_TYPE"] = att.get(data["instance"]["TRANSFORMATION_TYPE"])
+                        attribs["TYPE"] = att.get(data["instance"]["TYPE"])
+                        attribs["ID_SOURCE_OR_TARGET_OR_TRANSFORMATION"] = reference[att.get(data["instance"]["TRANSFORMATION_NAME"])]
+                        for i in portion:        
+                            temp = i.attrib
+                            attribs["ASSOCIATED_SOURCE_INSTANCE_NAME"] = temp.get(data["common"]["NAME"])
+                        instance_id = instance_id + 1
+                        if att.get(data["instance"]["TYPE"]) == "SOURCE":
+                            attribs["STAGE"] = 1
+                        elif attribs["TYPE"] == "TRANSFORMATION":
+                            for i in stage:
+                                x = " "
+                                if att.get(data['instance']['TRANSFORMATION_TYPE']) in i.keys() and att.get(data['instance']['TRANSFORMATION_NAME']) in i.keys():
+                                    attribs["STAGE"] = i[att.get(data['instance']['TRANSFORMATION_TYPE'])]
+                                    x = "break"
+
+                                if x == "break":
+                                                break
+                                        
+                        else :
+                            attribs["STAGE"] = flag + 3
+                        list_of_attribs.append(attribs)                    
+
+    list_of_counts.append({"TABLE_NAME" : "INSTANCE","COLUMN_NAME" : "INSTANCE_ID","COUNTER_VALUE":instance_id-1})
+    make_avro(list_of_attribs,"./avsc/instance.avsc","/tmp/u_instance.avro","/tmp/instance.avro") 
+    
+
+def fetch_table_inventory_relation(root,inv_id):
+    list_of_attribs= []
+    for repo in root.findall('*'):
+        for folder in repo:  
+            for func in folder:
+                attribs = {}
+                if func.tag =="SOURCE" or func.tag == "TARGET":
+                    att = func.attrib
+                    s3.Bucket('glue-poc').download_file('folder/tmp/table_master.avro', '/tmp/d_table_master.avro')
+                    reader = DataFileReader(open("/tmp/d_table_master.avro", "rb"), DatumReader())
+                    name = att.get(data["common"]["NAME"])
+                    dtype = att.get(data["table_master"]["DB_Type"])
+                    dbname = att.get(data["table_master"]["DBD_Name"])
+                    for entry in reader:
+                        if(entry["NAME"]==name  and entry["DATABASETYPE"]==dtype and entry["DBDNAME"]==dbname):
+                            count = entry["TABLE_ID"]
+                            break
+                    reader.close()
+
+                    attribs["INV_ID"] = inv_id
+                    attribs["TABLE_ID"] = count
+                    attribs["MODE"] = func.tag
+                    list_of_attribs.append(attribs)
+    
+    make_avro(list_of_attribs,"./avsc/table_inventory_relation.avsc","/tmp/u_table_inventory_relation.avro","folder/tmp/table_inventory_relation.avro")
+            
+            
+            
+def fetch_pro_inv_rel(pro_id,inv_id):
+    attribs = {}
+    #pro_id = body
+    attribs["PRO_ID"] = pro_id
+    attribs["INV_ID"] = inv_id                                            
+    print(attribs)
+    make_avro([attribs],"./avsc/project_inventory_relation.avsc","/tmp/u_project_inventory_relation.avro","folder/tmp/project_inventory_relation.avro")
+    
+def lambda_handler(event, context):
+        global list_of_counts
+        global id_count
+        f = open("test.cfg")
+        data = json.load(f)  
+        bucket_name = event['Records'][0]['s3']['bucket']['name']
+        print(event) 
+        path = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'])
+        temp = path.split('/')
+        filename = temp[-1]
+        print(filename)
+        name_list = filename.split('___')    
+        pro_id = float(name_list[0])
+        pro_id = int(pro_id)
+        id_count = fetch_previous_last_counts()
+        
+
+        if len(filename) > 0 :
+            response = client.get_object(Bucket=bucket_name,Key= path)
+            file= response['Body'].read().decode('utf-8')
+            root= ET.fromstring(file)
+            for repo in root.findall('*'):
+                for folder in repo:
+                    fetch_transformation_listing( folder,id_count["TRANSFORM_ID"])
+                    fetch_inventory_transformation_relation(folder,id_count["INV_ID"],id_count["TRANSFORM_ID"])
+                    fetch_column_relation(folder,id_count["INV_ID"],id_count["INSTANCE_ID"])
+                    fetch_inventory_master(folder,id_count["INV_ID"])
+                    fetch_transformation_relation(folder,id_count["TRANSFORM_ID"])
+                    fetch_table_column_relation(folder,id_count["INV_ID"],id_count["TABLE_ID"],id_count["COLUMN_ID"])
+                    fetch_column_master(folder,id_count["INV_ID"],id_count["COLUMN_ID"])
+                    fetch_table_master(folder,id_count["INV_ID"],id_count["TABLE_ID"])
+                    fetch_instance(folder,id_count["INV_ID"] , id_count["INSTANCE_ID"],id_count["TRANSFORM_ID"])
+                    fetch_table_inventory_relation(folder,id_count["INV_ID"])
+                    make_last_counts_avro(list_of_counts,"./avsc/last_counts.avsc","/tmp/u_last_counts.avro")
+                    fetch_pro_inv_rel(pro_id,id_count["INV_ID"])
+            
+           
+            fetch_transformation_listing( root,id_count["TRANSFORM_ID"])
+            fetch_inventory_transformation_relation(root,id_count["INV_ID"],id_count["TRANSFORM_ID"])
+            fetch_column_relation(root,id_count["INV_ID"],id_count["INSTANCE_ID"])
+            fetch_inventory_master(root,id_count["INV_ID"])
+            fetch_transformation_relation(root,id_count["TRANSFORM_ID"])
+            fetch_table_column_relation(root,id_count["INV_ID"],id_count["TABLE_ID"],id_count["COLUMN_ID"])
+            fetch_column_master(root,id_count["INV_ID"],id_count["COLUMN_ID"])
+            fetch_table_master(root,id_count["INV_ID"],id_count["TABLE_ID"])
+            fetch_instance(root,id_count["INV_ID"] , id_count["INSTANCE_ID"],id_count["TRANSFORM_ID"])
+            fetch_table_inventory_relation(root,id_count["INV_ID"])
+            make_last_counts_avro(list_of_counts,"./avsc/last_counts.avsc","/tmp/u_last_counts.avro")
+            fetch_pro_inv_rel(pro_id,id_count["INV_ID"])
+            
+            
+            
+            # def fetch_pro_inv_rel(x,y):
+            #     attribs = {}
+            #     attribs["proj_id"] = x
+            #     attribs["inv_id"] = y
+            
+            # fetch_pro_inv_rel(pro_id,id_count[inv_id])
+            
+
+     
+            
+            
+            
+    
+            
+              
+            
+            
+        
